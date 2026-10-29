@@ -1,0 +1,6 @@
+{
+  "name": "PulseDeck MP3 — YouTube Audio & Batch Extractor",
+  "description": "Studio-grade YouTube to MP3 converter and multi-video batch downloader with bitrate control, ID3 tagging, and ZIP archiving.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
