@@ -6,13 +6,12 @@ import fs from 'fs';
 import os from 'os';
 import { Readable } from 'stream';
 import { createRequire } from 'module';
-import JSZip from 'jszip';
 
 const require = createRequire(import.meta.url);
 const { Ytdl, Quality } = require('@distube/ytdl-core');
 
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
 app.use(express.json({ limit: '10mb' }));
 
@@ -34,24 +33,6 @@ let cachedCnvRefererAt = 0;
 
 // In-memory cache of resolved direct MP3 download URLs by videoId
 const resolvedDownloadUrlCache = new Map<string, { url: string; expiresAt: number }>();
-
-// Seed known recently converted long videos so they resolve instantaneously
-resolvedDownloadUrlCache.set('MVV0jd_DHE8', {
-  url: 'https://apio17dlp.cnvmp3.site/downloads/download.php?file=/MVV0jd_DHE8_06a04.mp3',
-  expiresAt: Date.now() + 2 * 60 * 60 * 1000,
-});
-resolvedDownloadUrlCache.set('rottoMumUj4', {
-  url: 'https://apio7dlp.cnvmp3.site/downloads/download.php?file=/test_54fd6.mp3',
-  expiresAt: Date.now() + 2 * 60 * 60 * 1000,
-});
-resolvedDownloadUrlCache.set('fplaUA5X0EY', {
-  url: 'https://apio11dlp.cnvmp3.site/downloads/download.php?file=/audio_fplaUA5X0EY_95827.mp3',
-  expiresAt: Date.now() + 2 * 60 * 60 * 1000,
-});
-resolvedDownloadUrlCache.set('IOr0LGXH7oU', {
-  url: 'https://apio17dlp.cnvmp3.site/downloads/download.php?file=/audio_IOr0LGXH7oU_3617c.mp3',
-  expiresAt: Date.now() + 2 * 60 * 60 * 1000,
-});
 
 // Serialize live conversion requests so concurrent batch clicks never trigger upstream IP rate limits
 let conversionChain: Promise<unknown> = Promise.resolve();
@@ -506,7 +487,7 @@ function processBufferOrStreamWithFfmpeg(
       tmpOutFile
     );
 
-    const ff = spawn('/usr/bin/ffmpeg', ffmpegArgs);
+    const ff = spawn(process.env.FFMPEG_PATH || 'ffmpeg', ffmpegArgs);
 
     if (!tmpInFile && typeof inputSource !== 'string' && !Buffer.isBuffer(inputSource)) {
       inputSource.on('error', (err: Error) => {
@@ -635,22 +616,31 @@ app.post('/api/resolve', async (req, res) => {
     const cleaned = urls
       .map((u) => String(u).trim())
       .filter(Boolean)
-      .slice(0, 30);
+      .slice(0, 50);
 
-    const results = await Promise.all(
-      cleaned.map(async (rawUrl) => {
+    // Results are written back by index, so the response is always in the same
+    // order as the links that were sent, even though lookups run in parallel.
+    const results = new Array<
+      | { ok: true; data: VideoMetadata }
+      | { ok: false; input: string; error: string }
+    >(cleaned.length);
+    let next = 0;
+    const worker = async () => {
+      while (next < cleaned.length) {
+        const i = next++;
+        const rawUrl = cleaned[i];
         try {
-          const meta = await resolveVideoMetadata(rawUrl);
-          return { ok: true as const, data: meta };
+          results[i] = { ok: true, data: await resolveVideoMetadata(rawUrl) };
         } catch (err) {
-          return {
-            ok: false as const,
+          results[i] = {
+            ok: false,
             input: rawUrl,
             error: err instanceof Error ? err.message : 'Unable to resolve link',
           };
         }
-      })
-    );
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(5, cleaned.length) }, worker));
 
     res.json({ results });
   } catch (err) {
@@ -702,7 +692,10 @@ app.get('/api/download', async (req, res) => {
       return;
     }
 
-    const safeName = sanitizeFilename(`${artist} - ${title}`);
+    // Optional "01", "02"... prefix so files sort in the same order the links were given
+    const prefix = String(req.query.prefix || '').replace(/\D/g, '').slice(0, 4);
+    const baseName = sanitizeFilename(`${artist} - ${title}`);
+    const safeName = prefix ? `${prefix} - ${baseName}` : baseName;
     const asciiFallbackName =
       safeName.replace(/[^\x20-\x7E]/g, '').trim() || `youtube-${videoId}`;
 
@@ -772,74 +765,6 @@ app.get('/api/download', async (req, res) => {
   } catch (err) {
     res.status(500).json({
       error: err instanceof Error ? err.message : 'MP3 conversion failed',
-    });
-  }
-});
-
-// POST /api/batch-zip - Convert multiple YouTube videos to full-length MP3 and bundle into a .zip archive
-app.post('/api/batch-zip', async (req, res) => {
-  try {
-    const { items } = req.body as {
-      items?: Array<{
-        videoId: string;
-        title: string;
-        artist: string;
-        bitrate: number;
-        normalize: boolean;
-        durationSeconds?: number;
-        trimStart?: number;
-        trimEnd?: number;
-      }>;
-    };
-
-    if (!Array.isArray(items) || items.length === 0) {
-      res.status(400).json({ error: 'No tracks provided for batch ZIP export.' });
-      return;
-    }
-
-    const zip = new JSZip();
-    const usedNames = new Set<string>();
-
-    for (const item of items.slice(0, 25)) {
-      if (!/^[a-zA-Z0-9_-]{11}$/.test(item.videoId)) continue;
-      const mp3Buffer = await generateMp3Buffer({
-        videoId: item.videoId,
-        title: item.title || item.videoId,
-        artist: item.artist || 'YouTube',
-        bitrate: item.bitrate || 320,
-        normalize: Boolean(item.normalize),
-        durationSeconds: item.durationSeconds,
-        trimStart: item.trimStart,
-        trimEnd: item.trimEnd,
-      });
-
-      let baseName = sanitizeFilename(`${item.artist} - ${item.title}`);
-      let finalName = `${baseName}.mp3`;
-      let counter = 2;
-      while (usedNames.has(finalName.toLowerCase())) {
-        finalName = `${baseName} (${counter}).mp3`;
-        counter++;
-      }
-      usedNames.add(finalName.toLowerCase());
-      zip.file(finalName, mp3Buffer);
-    }
-
-    const zipBuffer = await zip.generateAsync({
-      type: 'nodebuffer',
-      compression: 'STORE',
-    });
-
-    const timestamp = new Date().toISOString().slice(0, 10);
-    res.setHeader('Content-Type', 'application/zip');
-    res.setHeader('Content-Length', String(zipBuffer.length));
-    res.setHeader(
-      'Content-Disposition',
-      `attachment; filename="PulseDeck-MP3-Batch-${timestamp}.zip"`
-    );
-    res.send(zipBuffer);
-  } catch (err) {
-    res.status(500).json({
-      error: err instanceof Error ? err.message : 'Failed to build batch ZIP archive',
     });
   }
 });
