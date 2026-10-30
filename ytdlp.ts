@@ -143,6 +143,15 @@ function cacheKey(videoId: string, bitrate: number) {
   return `${videoId}_${bitrate}`;
 }
 
+export function finalPath(videoId: string, bitrate: number): string {
+  return path.join(CACHE_DIR, `${cacheKey(videoId, bitrate)}.mp3`);
+}
+
+export function tempPath(videoId: string, bitrate: number): string {
+  fs.mkdirSync(CACHE_DIR, { recursive: true });
+  return path.join(CACHE_DIR, `${cacheKey(videoId, bitrate)}.tmp${Date.now()}.mp3`);
+}
+
 export function cachedFile(videoId: string, bitrate: number): string | null {
   const file = path.join(CACHE_DIR, `${cacheKey(videoId, bitrate)}.mp3`);
   try {
