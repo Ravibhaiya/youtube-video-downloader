@@ -1,9 +1,12 @@
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
+import fs from 'fs';
 import path from 'path';
 import { Readable } from 'stream';
+import { pipeline } from 'stream/promises';
 import { createRequire } from 'module';
 import * as yt from './ytdlp.ts';
+import { verifyMp3 } from './mp3check.ts';
 
 const require = createRequire(import.meta.url);
 const { Ytdl } = require('@distube/ytdl-core');
@@ -368,6 +371,39 @@ interface Job {
 const jobs = new Map<string, Job>();
 const jobKey = (videoId: string, bitrate: number) => `${videoId}_${bitrate}`;
 
+// Fallback engine: fetch the converter's file onto disk so it can be checked before anyone receives it
+async function fetchConverterFile(videoId: string, bitrate: number, expectedSeconds?: number): Promise<string> {
+  const directUrl = await resolveDirectMp3UrlViaConverter(videoId, bitrate, expectedSeconds);
+  const upstream = await fetch(directUrl, {
+    headers: { 'User-Agent': BROWSER_UA, Referer: 'https://cnvmp3.com/' },
+  });
+  if (!upstream.ok || !upstream.body) {
+    resolvedDownloadUrlCache.delete(videoId);
+    throw new Error('The converter did not return the file.');
+  }
+  const type = upstream.headers.get('content-type') || '';
+  if (/text\/html|json/i.test(type)) {
+    resolvedDownloadUrlCache.delete(videoId);
+    throw new Error('The converter returned a web page instead of audio.');
+  }
+  const tmp = yt.tempPath(videoId, bitrate);
+  try {
+    await pipeline(Readable.fromWeb(upstream.body as import('stream/web').ReadableStream), fs.createWriteStream(tmp));
+    await verifyMp3(tmp, expectedSeconds);
+  } catch (err) {
+    fs.rmSync(tmp, { force: true });
+    resolvedDownloadUrlCache.delete(videoId); // do not reuse a bad link
+    throw err;
+  }
+  fs.renameSync(tmp, yt.finalPath(videoId, bitrate));
+  return yt.finalPath(videoId, bitrate);
+}
+
+function logConversion(videoId: string, bitrate: number, engine: string, file: string, expected?: number) {
+  const mb = (fs.statSync(file).size / 1048576).toFixed(1);
+  console.log(`[convert] ${videoId} ${bitrate}k via ${engine}: ${mb} MB, expected length ${expected ? `${expected}s` : "unknown"}`);
+}
+
 async function runPrepare(
   videoId: string,
   bitrate: number,
@@ -379,26 +415,34 @@ async function runPrepare(
   let ytdlpError: Error | null = null;
   if (useYtdlp()) {
     try {
-      await yt.convertToMp3(videoId, bitrate);
+      const file = await yt.convertToMp3(videoId, bitrate);
+      try {
+        await verifyMp3(file, durationSeconds);
+      } catch (err) {
+        fs.rmSync(file, { force: true }); // never keep a file that failed the check
+        throw err;
+      }
+      logConversion(videoId, bitrate, 'yt-dlp', file, durationSeconds);
       return 'ytdlp';
     } catch (err) {
       ytdlpError = err instanceof Error ? err : new Error(String(err));
+      console.warn(`[convert] ${videoId} yt-dlp failed: ${ytdlpError.message}`);
       if (ENGINE === 'ytdlp') throw ytdlpError;
     }
   }
   try {
-    await resolveDirectMp3UrlViaConverter(videoId, bitrate, durationSeconds);
+    const file = await fetchConverterFile(videoId, bitrate, durationSeconds);
+    logConversion(videoId, bitrate, 'converter', file, durationSeconds);
     return 'converter';
   } catch (err) {
+    console.warn(`[convert] ${videoId} converter failed: ${err instanceof Error ? err.message : err}`);
     throw ytdlpError ?? err;
   }
 }
 
 function jobStillValid(job: Job, videoId: string, bitrate: number): boolean {
   if (job.state !== 'ready') return true;
-  if (job.engine === 'ytdlp') return yt.cachedFile(videoId, bitrate) !== null;
-  const cached = resolvedDownloadUrlCache.get(videoId);
-  return Boolean(cached && cached.expiresAt > Date.now());
+  return yt.cachedFile(videoId, bitrate) !== null;
 }
 
 // Starts a conversion (or joins the one already running). A failed job is started again.
@@ -538,40 +582,15 @@ app.get('/api/download', async (req, res) => {
       return;
     }
 
-    if (job.engine === 'ytdlp') {
-      const file = yt.cachedFile(videoId, bitrate);
-      if (!file) {
-        res.status(500).json({ error: 'The converted file expired. Please try again.' });
-        return;
-      }
-      // sendFile adds Content-Length and supports resuming a partly finished download
-      res.download(file, `${safeName}.mp3`, { dotfiles: 'allow' }, (err) => {
-        if (err && !res.headersSent) res.status(500).json({ error: 'Could not send the file.' });
-      });
+    const file = yt.cachedFile(videoId, bitrate);
+    if (!file) {
+      res.status(500).json({ error: 'The converted file expired. Please try again.' });
       return;
     }
-
-    // Fallback engine: pass the converter's file straight through without holding it in memory
-    const directUrl = await resolveDirectMp3UrlViaConverter(videoId, bitrate, duration);
-    const upstream = await fetch(directUrl, {
-      headers: { 'User-Agent': BROWSER_UA, Referer: 'https://cnvmp3.com/' },
+    // sendFile adds Content-Length and supports resuming a partly finished download
+    res.download(file, `${safeName}.mp3`, { dotfiles: 'allow' }, (err) => {
+      if (err && !res.headersSent) res.status(500).json({ error: 'Could not send the file.' });
     });
-    if (!upstream.ok || !upstream.body) {
-      resolvedDownloadUrlCache.delete(videoId);
-      res.status(502).json({ error: 'The converter did not return the file. Please try again.' });
-      return;
-    }
-    const asciiName = safeName.replace(/[^\x20-\x7E]/g, '').trim() || `youtube-${videoId}`;
-    res.setHeader('Content-Type', 'audio/mpeg');
-    const contentLength = upstream.headers.get('content-length');
-    if (contentLength) res.setHeader('Content-Length', contentLength);
-    res.setHeader(
-      'Content-Disposition',
-      `attachment; filename="${asciiName}.mp3"; filename*=UTF-8''${encodeURIComponent(safeName)}.mp3`
-    );
-    const stream = Readable.fromWeb(upstream.body as import('stream/web').ReadableStream);
-    stream.on('error', () => res.destroy());
-    stream.pipe(res);
   } catch (err) {
     if (!res.headersSent) {
       res.status(500).json({ error: err instanceof Error ? err.message : 'MP3 conversion failed.' });

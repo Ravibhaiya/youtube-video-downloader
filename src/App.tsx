@@ -46,8 +46,13 @@ function parseLinks(text: string): { links: string[]; ignored: number } {
 }
 
 // "01", "02"... wide enough for the whole list, so files sort in the order they were given
-function orderPrefix(index: number, total: number): string {
+function rowNumber(index: number, total: number): string {
   return String(index + 1).padStart(Math.max(2, String(total).length), '0');
+}
+
+// A single video keeps its plain name; numbers only matter when there are several
+function filePrefix(index: number, total: number): string {
+  return total > 1 ? rowNumber(index, total) : '';
 }
 
 function fileName(track: Track, index: number, total: number): string {
@@ -56,7 +61,8 @@ function fileName(track: Track, index: number, total: number): string {
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 100);
-  return `${orderPrefix(index, total)} - ${base || track.videoId}.mp3`;
+  const prefix = filePrefix(index, total);
+  return `${prefix ? `${prefix} - ` : ''}${base || track.videoId}.mp3`;
 }
 
 function downloadUrl(track: Track, index: number, total: number, bitrate: BitrateOption): string {
@@ -66,7 +72,7 @@ function downloadUrl(track: Track, index: number, total: number, bitrate: Bitrat
     artist: track.author,
     bitrate: String(bitrate),
     duration: String(track.durationSeconds || 0),
-    prefix: orderPrefix(index, total),
+    prefix: filePrefix(index, total),
   });
   return `/api/download?${params.toString()}`;
 }
@@ -417,7 +423,7 @@ export default function App() {
               {tracks.map((track, index) => (
                 <li key={track.id} className="flex items-center gap-3 px-3 py-3">
                   <span className="w-7 shrink-0 text-right text-[15px] font-semibold tabular-nums text-muted">
-                    {orderPrefix(index, tracks.length)}
+                    {rowNumber(index, tracks.length)}
                   </span>
                   <img
                     src={track.thumbnailUrl}

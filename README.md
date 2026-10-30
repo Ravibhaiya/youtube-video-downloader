@@ -30,6 +30,9 @@ Keep yt-dlp up to date (`pip install -U yt-dlp`). YouTube changes often and old 
 
 ## Troubleshooting
 
+- Every converted file is checked before it is sent: it must be real MP3 audio and its length must match
+  the video (within a few seconds). If not, you get an error instead of a wrong file, and the server log
+  shows a line starting with [convert] saying why. Check that log first when something looks wrong.
 - "YouTube is asking this server to prove it is not a bot": common on cloud/datacenter servers.
   Export cookies from a logged-in browser (Netscape format) and set YTDLP_COOKIES=/path/cookies.txt.
   Running the server on your own computer or home connection usually avoids this.
