@@ -5,8 +5,9 @@ import type { BitrateOption, Track } from './types';
 
 const MAX_TRACKS = 50;
 const BITRATES: BitrateOption[] = [128, 192, 320];
-// The converter only offers 128 kbps for videos longer than about 20 minutes
-const LONG_VIDEO_SECONDS = 1180;
+const LONG_VIDEO_SECONDS = 20 * 60;
+const POLL_MS = 1500;
+const GIVE_UP_MS = 95 * 60 * 1000;
 
 type Notice = { kind: 'error' | 'info'; text: string };
 
@@ -17,6 +18,7 @@ function sleep(ms: number) {
 }
 
 function formatDuration(seconds: number): string {
+  if (!seconds) return '';
   const s = Math.max(0, Math.floor(seconds || 0));
   const h = Math.floor(s / 3600);
   const m = Math.floor((s % 3600) / 60);
@@ -72,6 +74,42 @@ function downloadUrl(track: Track, index: number, total: number, bitrate: Bitrat
 async function readError(res: Response, fallback: string): Promise<string> {
   const data = await res.json().catch(() => null);
   return (data && typeof data.error === 'string' && data.error) || fallback;
+}
+
+// Converting a long video can take minutes, so the server works in the background and we ask how it is going
+async function prepareTrack(track: Track, bitrate: BitrateOption): Promise<void> {
+  const start = () =>
+    fetch('/api/prepare', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        videoId: track.videoId,
+        bitrate,
+        durationSeconds: track.durationSeconds,
+      }),
+    });
+
+  let res = await start();
+  if (!res.ok) throw new Error(await readError(res, 'Conversion failed.'));
+  let state = await res.json();
+
+  const deadline = Date.now() + GIVE_UP_MS;
+  while (state.state !== 'ready') {
+    if (state.state === 'error') throw new Error(state.error || 'Conversion failed.');
+    if (Date.now() > deadline) throw new Error('This is taking too long. Try again later.');
+    await sleep(POLL_MS);
+    const status = await fetch(
+      `/api/prepare/status?videoId=${encodeURIComponent(track.videoId)}&bitrate=${bitrate}`
+    );
+    if (!status.ok) throw new Error(await readError(status, 'Lost contact with the server.'));
+    state = await status.json();
+    if (state.state === 'idle') {
+      // the server restarted and forgot the job: start it again
+      res = await start();
+      if (!res.ok) throw new Error(await readError(res, 'Conversion failed.'));
+      state = await res.json();
+    }
+  }
 }
 
 function saveFromUrl(href: string, name: string) {
@@ -132,11 +170,13 @@ export default function App() {
       const known = new Set(tracks.map((t) => t.videoId));
       const added: Track[] = [];
       const failed: string[] = [];
+      let firstReason = '';
       let duplicates = 0;
 
       for (const item of data.results || []) {
         if (!item.ok) {
           failed.push(item.input);
+          if (!firstReason) firstReason = item.error || '';
         } else if (known.has(item.data.videoId)) {
           duplicates++;
         } else {
@@ -160,7 +200,7 @@ export default function App() {
 
       const notes: string[] = [];
       if (duplicates) notes.push(`${duplicates} already in the list`);
-      if (failed.length) notes.push(`${failed.length} could not be read`);
+      if (failed.length) notes.push(`${failed.length} could not be read${firstReason ? ` (${firstReason.replace(/\.$/, '')})` : ''}`);
       if (links.length > room) notes.push(`${links.length - room} left out because the list is full`);
       if (ignored) notes.push(`${ignored} ignored because they are not YouTube links`);
       if (notes.length) {
@@ -180,16 +220,7 @@ export default function App() {
   async function saveOne(track: Track, index: number, total: number): Promise<boolean> {
     patch(track.id, { status: 'converting', error: undefined });
     try {
-      const prep = await fetch('/api/prepare', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          videoId: track.videoId,
-          bitrate,
-          durationSeconds: track.durationSeconds,
-        }),
-      });
-      if (!prep.ok) throw new Error(await readError(prep, 'Conversion failed.'));
+      await prepareTrack(track, bitrate);
       saveFromUrl(downloadUrl(track, index, total, bitrate), fileName(track, index, total));
       patch(track.id, { status: 'done' });
       return true;
@@ -240,6 +271,7 @@ export default function App() {
       const track = tracks[i];
       patch(track.id, { status: 'converting', error: undefined });
       try {
+        await prepareTrack(track, bitrate);
         const res = await fetch(downloadUrl(track, i, total, bitrate));
         if (!res.ok) throw new Error(await readError(res, 'Conversion failed.'));
         zip.file(fileName(track, i, total), await res.blob());
@@ -376,7 +408,9 @@ export default function App() {
               </button>
             </div>
             {hasLongVideo && (
-              <p className="mt-1 text-sm text-muted">Videos over 20 minutes always convert at 128 kbps.</p>
+              <p className="mt-1 text-sm text-muted">
+                Long videos make big files, roughly 60 to 145 MB per hour. For those, use Download all instead of ZIP.
+              </p>
             )}
 
             <ol className="mt-3 divide-y divide-line overflow-hidden rounded-lg border border-line bg-card">
@@ -399,7 +433,9 @@ export default function App() {
                     <p className="line-clamp-2 text-[15px] font-medium leading-snug [overflow-wrap:anywhere]">{track.title}</p>
                     <p className="mt-0.5 flex flex-wrap items-center gap-x-3 text-[13px] text-muted">
                       <span className="truncate">{track.author}</span>
-                      <span className="tabular-nums">{formatDuration(track.durationSeconds)}</span>
+                      {track.durationSeconds > 0 && (
+                        <span className="tabular-nums">{formatDuration(track.durationSeconds)}</span>
+                      )}
                     </p>
                     <StatusLine track={track} />
                   </div>

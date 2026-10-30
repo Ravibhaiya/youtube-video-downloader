@@ -1,19 +1,26 @@
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
-import { spawn } from 'child_process';
-import fs from 'fs';
-import os from 'os';
 import { Readable } from 'stream';
 import { createRequire } from 'module';
+import * as yt from './ytdlp.ts';
 
 const require = createRequire(import.meta.url);
-const { Ytdl, Quality } = require('@distube/ytdl-core');
+const { Ytdl } = require('@distube/ytdl-core');
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
-app.use(express.json({ limit: '10mb' }));
+// ENGINE=auto      yt-dlp on this server when installed, otherwise the third-party converter (default)
+// ENGINE=ytdlp     yt-dlp only, never contacts a third-party converter
+// ENGINE=converter third-party converter only (cnvmp3.com), no yt-dlp
+type EngineSetting = 'auto' | 'ytdlp' | 'converter';
+const ENGINE: EngineSetting = ['ytdlp', 'converter'].includes(String(process.env.ENGINE))
+  ? (process.env.ENGINE as EngineSetting)
+  : 'auto';
+const useYtdlp = () => ENGINE !== 'converter' && yt.ytdlpInfo().available;
+
+app.use(express.json({ limit: '1mb' }));
 
 export interface VideoMetadata {
   videoId: string;
@@ -21,12 +28,14 @@ export interface VideoMetadata {
   title: string;
   author: string;
   thumbnailUrl: string;
-  durationSeconds: number;
+  durationSeconds: number; // 0 means the duration is not known
   isLive: boolean;
 }
 
 const BROWSER_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
+// ---------- Fallback engine: third-party converter (cnvmp3.com) ----------
 
 let cachedCnvReferer = '';
 let cachedCnvRefererAt = 0;
@@ -211,29 +220,6 @@ async function resolveDirectMp3UrlViaConverter(
   throw new Error('Remote YouTube converter could not process this video');
 }
 
-async function fetchFullYouTubeMp3ViaConverter(
-  videoId: string,
-  bitrate: number,
-  durationSeconds?: number
-): Promise<Buffer> {
-  const safeDownloadUrl = await resolveDirectMp3UrlViaConverter(videoId, bitrate, durationSeconds);
-  const audioRes = await fetch(safeDownloadUrl, {
-    headers: {
-      'User-Agent': BROWSER_UA,
-      Referer: 'https://cnvmp3.com/',
-    },
-  });
-  if (audioRes.ok) {
-    const arrayBuf = await audioRes.arrayBuffer();
-    const buf = Buffer.from(arrayBuf);
-    if (buf.length > 10000) {
-      return buf;
-    }
-  }
-  resolvedDownloadUrlCache.delete(videoId);
-  throw new Error('Failed to fetch converted MP3 stream');
-}
-
 function extractVideoId(inputUrl: string): string | null {
   const trimmed = inputUrl.trim();
   if (/^[a-zA-Z0-9_-]{11}$/.test(trimmed)) {
@@ -266,125 +252,98 @@ function extractVideoId(inputUrl: string): string | null {
   return match ? match[1] : null;
 }
 
-function deterministicDuration(videoId: string): number {
-  let hash = 0;
-  for (let i = 0; i < videoId.length; i++) {
-    hash = (hash * 31 + videoId.charCodeAt(i)) >>> 0;
-  }
-  return 180 + (hash % 120);
-}
 
-async function resolveVideoMetadata(rawInput: string): Promise<VideoMetadata> {
-  const trimmedInput = rawInput.trim();
-  const videoId = extractVideoId(trimmedInput);
+// ---------- Video information ----------
 
-  const ytdl = new Ytdl();
+const VIDEO_ID = /^[a-zA-Z0-9_-]{11}$/;
 
-  // If the user typed a search query (keywords instead of a URL), search YouTube for the top video match
-  if (!videoId && trimmedInput.length >= 2) {
-    try {
-      const searchResults = await ytdl.search(trimmedInput, { limit: 5 });
-      const topMatch = (searchResults || []).find((item: { id?: string }) => item.id);
-      if (topMatch && topMatch.id) {
-        return {
-          videoId: topMatch.id,
-          url: `https://www.youtube.com/watch?v=${topMatch.id}`,
-          title: topMatch.title || trimmedInput,
-          author: topMatch.author?.name || 'YouTube Creator',
-          thumbnailUrl: `https://i.ytimg.com/vi/${topMatch.id}/hqdefault.jpg`,
-          durationSeconds: Number(topMatch.lengthSeconds) || deterministicDuration(topMatch.id),
-          isLive: Boolean(topMatch.isLive),
-        };
-      }
-    } catch {
-      // Fallthrough
-    }
-    throw new Error(`Invalid YouTube URL or search query: ${rawInput}`);
-  }
-
-  if (!videoId) {
-    throw new Error(`Invalid YouTube URL: ${rawInput}`);
-  }
-
+// Used only when yt-dlp is not available. It never invents a title or a length: unknown stays unknown.
+async function fallbackMetadata(videoId: string): Promise<VideoMetadata> {
   const canonicalUrl = `https://www.youtube.com/watch?v=${videoId}`;
+  const thumbnailUrl = `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
 
-  // 1. Fast & reliable YouTube InnerTube search by videoId (returns exact title, durationSeconds, and author in ~400ms)
   try {
-    const searchPromise = ytdl.search(videoId, { limit: 5 });
-    const timeoutPromise = new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error('search timeout')), 4500)
-    );
-    const results = await Promise.race([searchPromise, timeoutPromise]);
+    const ytdl = new Ytdl();
+    const results = await Promise.race([
+      ytdl.search(videoId, { limit: 5 }),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('search timeout')), 4500)),
+    ]);
     const exact = (results || []).find((r: { id?: string }) => r.id === videoId);
     if (exact && exact.title) {
       return {
         videoId,
         url: canonicalUrl,
         title: exact.title,
-        author: exact.author?.name || 'YouTube Creator',
-        thumbnailUrl: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
-        durationSeconds: Number(exact.lengthSeconds) || deterministicDuration(videoId),
+        author: exact.author?.name || 'YouTube',
+        thumbnailUrl,
+        durationSeconds: Number(exact.lengthSeconds) || 0,
         isLive: Boolean(exact.isLive),
       };
     }
   } catch {
-    // Fallthrough to noembed / oEmbed
+    // try the next source
   }
 
-  // 2. Fallback to noembed + YouTube oEmbed
-  let resolvedTitle = '';
-  let resolvedAuthor = '';
-  let resolvedThumb = `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
-
+  let title = '';
+  let author = '';
   try {
-    const noembedRes = await fetch(
-      `https://noembed.com/embed?url=${encodeURIComponent(canonicalUrl)}`
-    );
-    if (noembedRes.ok) {
-      const data = (await noembedRes.json()) as {
-        title?: string;
-        author_name?: string;
-        thumbnail_url?: string;
-      };
-      if (data.title) resolvedTitle = data.title;
-      if (data.author_name) resolvedAuthor = data.author_name;
-      if (data.thumbnail_url) resolvedThumb = data.thumbnail_url;
+    const r = await fetch(`https://noembed.com/embed?url=${encodeURIComponent(canonicalUrl)}`);
+    if (r.ok) {
+      const data = (await r.json()) as { title?: string; author_name?: string };
+      title = data.title || '';
+      author = data.author_name || '';
     }
   } catch {
-    // Ignore
+    // try the next source
   }
-
-  if (!resolvedTitle) {
+  if (!title) {
     try {
-      const oembedRes = await fetch(
+      const r = await fetch(
         `https://www.youtube.com/oembed?url=${encodeURIComponent(canonicalUrl)}&format=json`
       );
-      if (oembedRes.ok) {
-        const data = (await oembedRes.json()) as {
-          title?: string;
-          author_name?: string;
-          thumbnail_url?: string;
-          html?: string;
-        };
-        const iframeTitleMatch = data.html?.match(/title="([^"]+)"/);
-        resolvedTitle = data.title || (iframeTitleMatch ? iframeTitleMatch[1] : '');
-        resolvedAuthor = data.author_name || resolvedAuthor;
-        if (data.thumbnail_url) resolvedThumb = data.thumbnail_url;
+      if (r.ok) {
+        const data = (await r.json()) as { title?: string; author_name?: string };
+        title = data.title || '';
+        author = data.author_name || author;
       }
     } catch {
-      // Ignore
+      // give up below
+    }
+  }
+  if (!title) {
+    throw new Error('Could not read this video. It may be private or removed, or the link is wrong.');
+  }
+  return { videoId, url: canonicalUrl, title, author: author || 'YouTube', thumbnailUrl, durationSeconds: 0, isLive: false };
+}
+
+async function resolveVideoMetadata(rawInput: string): Promise<VideoMetadata> {
+  const videoId = extractVideoId(rawInput);
+  if (!videoId) throw new Error('This is not a valid YouTube video link.');
+
+  let meta: VideoMetadata | null = null;
+  let ytdlpError: Error | null = null;
+  if (useYtdlp()) {
+    try {
+      meta = await yt.fetchMetadata(videoId);
+    } catch (err) {
+      ytdlpError = err instanceof Error ? err : new Error(String(err));
+      if (ENGINE === 'ytdlp') throw ytdlpError;
+    }
+  }
+  if (!meta) {
+    try {
+      meta = await fallbackMetadata(videoId);
+    } catch (err) {
+      // yt-dlp's message is usually the more helpful one (private, removed, bot check...)
+      throw ytdlpError ?? err;
     }
   }
 
-  return {
-    videoId,
-    url: canonicalUrl,
-    title: resolvedTitle || `YouTube Audio (${videoId})`,
-    author: resolvedAuthor || 'YouTube Creator',
-    thumbnailUrl: resolvedThumb,
-    durationSeconds: deterministicDuration(videoId),
-    isLive: false,
-  };
+  if (meta.isLive) throw new Error('Live streams cannot be converted until they have ended.');
+  if (meta.durationSeconds > yt.MAX_VIDEO_SECONDS) {
+    throw new Error(`This video is longer than ${Math.round(yt.MAX_VIDEO_SECONDS / 3600)} hours.`);
+  }
+  return meta;
 }
 
 function sanitizeFilename(input: string): string {
@@ -397,219 +356,95 @@ function sanitizeFilename(input: string): string {
   );
 }
 
-interface TranscodeOptions {
-  videoId: string;
-  title: string;
-  artist: string;
-  bitrate: number; // 128, 192, 256, 320
-  normalize: boolean;
-  durationSeconds?: number;
-  trimStart?: number;
-  trimEnd?: number;
+// ---------- Conversion jobs ----------
+
+interface Job {
+  state: 'working' | 'ready' | 'error';
+  engine?: 'ytdlp' | 'converter';
+  error?: string;
+  promise: Promise<void>;
 }
 
-function processBufferOrStreamWithFfmpeg(
-  inputSource: Buffer | string | NodeJS.ReadableStream,
-  opts: TranscodeOptions,
-  isLive: boolean
-): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const idSuffix = `${opts.videoId}_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-    const tmpInFile = Buffer.isBuffer(inputSource)
-      ? path.join(os.tmpdir(), `pulsedeck_in_${idSuffix}.mp3`)
-      : null;
-    const tmpOutFile = path.join(os.tmpdir(), `pulsedeck_out_${idSuffix}.mp3`);
+const jobs = new Map<string, Job>();
+const jobKey = (videoId: string, bitrate: number) => `${videoId}_${bitrate}`;
 
-    if (tmpInFile && Buffer.isBuffer(inputSource)) {
-      fs.writeFileSync(tmpInFile, inputSource);
+async function runPrepare(
+  videoId: string,
+  bitrate: number,
+  durationSeconds?: number
+): Promise<'ytdlp' | 'converter'> {
+  if (ENGINE === 'ytdlp' && !yt.ytdlpInfo().available) {
+    throw new Error('yt-dlp is not installed on this server. See the README.');
+  }
+  let ytdlpError: Error | null = null;
+  if (useYtdlp()) {
+    try {
+      await yt.convertToMp3(videoId, bitrate);
+      return 'ytdlp';
+    } catch (err) {
+      ytdlpError = err instanceof Error ? err : new Error(String(err));
+      if (ENGINE === 'ytdlp') throw ytdlpError;
     }
+  }
+  try {
+    await resolveDirectMp3UrlViaConverter(videoId, bitrate, durationSeconds);
+    return 'converter';
+  } catch (err) {
+    throw ytdlpError ?? err;
+  }
+}
 
-    const canonicalUrl = `https://www.youtube.com/watch?v=${opts.videoId}`;
-    const validBitrate = [128, 192, 256, 320].includes(opts.bitrate) ? opts.bitrate : 320;
+function jobStillValid(job: Job, videoId: string, bitrate: number): boolean {
+  if (job.state !== 'ready') return true;
+  if (job.engine === 'ytdlp') return yt.cachedFile(videoId, bitrate) !== null;
+  const cached = resolvedDownloadUrlCache.get(videoId);
+  return Boolean(cached && cached.expiresAt > Date.now());
+}
 
-    let settled = false;
-    const cleanup = () => {
-      if (tmpInFile && fs.existsSync(tmpInFile)) {
-        try {
-          fs.unlinkSync(tmpInFile);
-        } catch {}
-      }
-      if (fs.existsSync(tmpOutFile)) {
-        try {
-          fs.unlinkSync(tmpOutFile);
-        } catch {}
-      }
-    };
-
-    const timer = setTimeout(() => {
-      if (!settled) {
-        settled = true;
-        cleanup();
-        reject(new Error('FFmpeg audio processing timed out'));
-      }
-    }, 90000);
-
-    const ffmpegArgs: string[] = ['-y'];
-    if (opts.trimStart && opts.trimStart > 0) {
-      ffmpegArgs.push('-ss', String(opts.trimStart));
+// Starts a conversion (or joins the one already running). A failed job is started again.
+function ensureJob(videoId: string, bitrate: number, durationSeconds?: number): Job {
+  const key = jobKey(videoId, bitrate);
+  const existing = jobs.get(key);
+  if (existing && existing.state !== 'error' && jobStillValid(existing, videoId, bitrate)) {
+    return existing;
+  }
+  const job: Job = { state: 'working', promise: Promise.resolve() };
+  job.promise = runPrepare(videoId, bitrate, durationSeconds).then(
+    (engine) => {
+      job.state = 'ready';
+      job.engine = engine;
+    },
+    (err) => {
+      job.state = 'error';
+      job.error = err instanceof Error ? err.message : 'Conversion failed.';
     }
+  );
+  jobs.set(key, job);
+  return job;
+}
 
-    if (tmpInFile) {
-      ffmpegArgs.push('-i', tmpInFile);
-    } else if (typeof inputSource === 'string') {
-      ffmpegArgs.push('-i', inputSource);
-    } else {
-      ffmpegArgs.push('-i', 'pipe:0');
-    }
+function parseBitrate(value: unknown): number {
+  const n = Number(value);
+  return [128, 192, 256, 320].includes(n) ? n : 192;
+}
 
-    if (opts.trimEnd && opts.trimEnd > (opts.trimStart || 0)) {
-      const clipDuration = opts.trimEnd - (opts.trimStart || 0);
-      ffmpegArgs.push('-t', String(clipDuration));
-    } else if (isLive) {
-      ffmpegArgs.push('-t', '30');
-    }
+// ---------- API ----------
 
-    ffmpegArgs.push('-vn', '-acodec', 'libmp3lame', '-b:a', `${validBitrate}k`, '-ar', '44100');
-
-    if (opts.normalize) {
-      ffmpegArgs.push('-af', 'dynaudnorm=f=150:g=15');
-    }
-
-    ffmpegArgs.push(
-      '-id3v2_version',
-      '3',
-      '-metadata',
-      `title=${opts.title}`,
-      '-metadata',
-      `artist=${opts.artist}`,
-      '-metadata',
-      `comment=Extracted from ${canonicalUrl}`,
-      tmpOutFile
-    );
-
-    const ff = spawn(process.env.FFMPEG_PATH || 'ffmpeg', ffmpegArgs);
-
-    if (!tmpInFile && typeof inputSource !== 'string' && !Buffer.isBuffer(inputSource)) {
-      inputSource.on('error', (err: Error) => {
-        if (!settled) {
-          settled = true;
-          clearTimeout(timer);
-          ff.kill('SIGKILL');
-          cleanup();
-          reject(err);
-        }
-      });
-      ff.stdin.on('error', () => {});
-      inputSource.pipe(ff.stdin);
-    }
-
-    ff.stderr.on('data', () => {});
-
-    ff.on('close', (code) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (code === 0 && fs.existsSync(tmpOutFile)) {
-        const stat = fs.statSync(tmpOutFile);
-        if (stat.size > 2048) {
-          const buf = fs.readFileSync(tmpOutFile);
-          cleanup();
-          resolve(buf);
-          return;
-        }
-      }
-      cleanup();
-      reject(new Error(`FFmpeg exited with code ${code}`));
-    });
+app.get('/api/health', (_req, res) => {
+  const info = yt.ytdlpInfo();
+  res.json({
+    engineSetting: ENGINE,
+    ytdlp: info,
+    using: useYtdlp() ? 'yt-dlp' : ENGINE === 'ytdlp' ? 'nothing (yt-dlp missing)' : 'third-party converter',
   });
-}
-
-async function generateMp3Buffer(opts: TranscodeOptions): Promise<Buffer> {
-  const canonicalUrl = `https://www.youtube.com/watch?v=${opts.videoId}`;
-  const needsPostProcessing =
-    Boolean(opts.normalize) ||
-    Boolean(opts.trimStart && opts.trimStart > 0) ||
-    Boolean(opts.trimEnd && opts.trimEnd > 0);
-
-  // Tier 1: Full-length YouTube to MP3 Converter Engine
-  try {
-    const rawMp3Buf = await fetchFullYouTubeMp3ViaConverter(
-      opts.videoId,
-      opts.bitrate,
-      opts.durationSeconds
-    );
-    if (!needsPostProcessing) {
-      return rawMp3Buf;
-    }
-    return await processBufferOrStreamWithFfmpeg(rawMp3Buf, opts, false);
-  } catch {
-    // Proceed to Tier 2
-  }
-
-  // Tier 2: Direct YouTube stream via @distube/ytdl-core v5 Ytdl
-  try {
-    const ytdl = new Ytdl();
-    const info = await Promise.race([
-      ytdl.getInfo(canonicalUrl),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('ytdl info timeout')), 8000)
-      ),
-    ]);
-    const isLive = Boolean(info?.videoDetails?.isLive);
-    const stream = ytdl.download(info, { quality: Quality.HighestAudio });
-    return await processBufferOrStreamWithFfmpeg(stream, opts, isLive);
-  } catch (err) {
-    throw new Error(
-      err instanceof Error
-        ? err.message
-        : `Unable to convert YouTube video (${opts.videoId}) to MP3.`
-    );
-  }
-}
-
-// GET /api/search - Search YouTube videos by keyword
-app.get('/api/search', async (req, res) => {
-  try {
-    const q = String(req.query.q || '').trim();
-    if (!q) {
-      res.json({ results: [] });
-      return;
-    }
-    const ytdl = new Ytdl();
-    const items = await ytdl.search(q, { limit: 8 });
-    const formatted: VideoMetadata[] = (items || [])
-      .filter((item: { id?: string }) => item.id)
-      .map(
-        (item: {
-          id: string;
-          title?: string;
-          author?: { name?: string };
-          lengthSeconds?: number;
-          isLive?: boolean;
-        }) => ({
-          videoId: item.id,
-          url: `https://www.youtube.com/watch?v=${item.id}`,
-          title: item.title || `YouTube Video (${item.id})`,
-          author: item.author?.name || 'YouTube Channel',
-          thumbnailUrl: `https://i.ytimg.com/vi/${item.id}/hqdefault.jpg`,
-          durationSeconds: Number(item.lengthSeconds) || 180,
-          isLive: Boolean(item.isLive),
-        })
-      );
-    res.json({ results: formatted });
-  } catch (err) {
-    res.status(500).json({
-      error: err instanceof Error ? err.message : 'Search failed',
-    });
-  }
 });
 
-// POST /api/resolve - Resolve single or multiple YouTube URLs or search queries in parallel
+// Resolve YouTube links. The response lists results in exactly the order the links were sent.
 app.post('/api/resolve', async (req, res) => {
   try {
     const { urls } = req.body as { urls?: string[] };
     if (!Array.isArray(urls) || urls.length === 0) {
-      res.status(400).json({ error: 'Please provide at least one YouTube URL or keyword.' });
+      res.status(400).json({ error: 'Please provide at least one YouTube link.' });
       return;
     }
 
@@ -618,11 +453,9 @@ app.post('/api/resolve', async (req, res) => {
       .filter(Boolean)
       .slice(0, 50);
 
-    // Results are written back by index, so the response is always in the same
-    // order as the links that were sent, even though lookups run in parallel.
+    // Results are written back by index, so the order never depends on which lookup finishes first
     const results = new Array<
-      | { ok: true; data: VideoMetadata }
-      | { ok: false; input: string; error: string }
+      { ok: true; data: VideoMetadata } | { ok: false; input: string; error: string }
     >(cleaned.length);
     let next = 0;
     const worker = async () => {
@@ -635,141 +468,143 @@ app.post('/api/resolve', async (req, res) => {
           results[i] = {
             ok: false,
             input: rawUrl,
-            error: err instanceof Error ? err.message : 'Unable to resolve link',
+            error: err instanceof Error ? err.message : 'Unable to read this link.',
           };
         }
       }
     };
-    await Promise.all(Array.from({ length: Math.min(5, cleaned.length) }, worker));
+    await Promise.all(Array.from({ length: Math.min(4, cleaned.length) }, worker));
 
     res.json({ results });
   } catch (err) {
     res.status(500).json({
-      error: err instanceof Error ? err.message : 'Unexpected server error while resolving URLs',
+      error: err instanceof Error ? err.message : 'Unexpected server error while reading links.',
     });
   }
 });
 
-// POST /api/prepare - Prepare/convert a video and warm the direct stream cache before browser download
-app.post('/api/prepare', async (req, res) => {
-  try {
-    const { videoId, bitrate, durationSeconds } = req.body as {
-      videoId?: string;
-      bitrate?: number;
-      durationSeconds?: number;
-    };
-    const cleanId = String(videoId || '').trim();
-    if (!/^[a-zA-Z0-9_-]{11}$/.test(cleanId)) {
-      res.status(400).json({ error: 'Valid 11-character YouTube videoId is required.' });
-      return;
-    }
-
-    await resolveDirectMp3UrlViaConverter(cleanId, Number(bitrate) || 320, durationSeconds);
-    res.json({ ok: true, videoId: cleanId });
-  } catch (err) {
-    res.status(500).json({
-      error: err instanceof Error ? err.message : 'Failed to prepare MP3 conversion',
-    });
+// Start converting one video. Returns at once; the browser then asks for the status until it is ready.
+app.post('/api/prepare', (req, res) => {
+  const { videoId, bitrate, durationSeconds } = req.body as {
+    videoId?: string;
+    bitrate?: number;
+    durationSeconds?: number;
+  };
+  const id = String(videoId || '').trim();
+  if (!VIDEO_ID.test(id)) {
+    res.status(400).json({ error: 'A valid 11-character YouTube video id is required.' });
+    return;
   }
+  const job = ensureJob(id, parseBitrate(bitrate), durationSeconds);
+  res.json({ state: job.state, error: job.error });
 });
 
-// GET /api/download - Stream or download a single full-length MP3 file
+app.get('/api/prepare/status', (req, res) => {
+  const id = String(req.query.videoId || '').trim();
+  if (!VIDEO_ID.test(id)) {
+    res.status(400).json({ error: 'A valid 11-character YouTube video id is required.' });
+    return;
+  }
+  const bitrate = parseBitrate(req.query.bitrate);
+  const job = jobs.get(jobKey(id, bitrate));
+  if (!job) {
+    res.json({ state: 'idle' });
+    return;
+  }
+  res.json({ state: job.state, error: job.error });
+});
+
+// Send the finished MP3. The optional "prefix" (01, 02...) is put in front of the file name.
 app.get('/api/download', async (req, res) => {
   try {
     const videoId = String(req.query.videoId || '').trim();
+    if (!VIDEO_ID.test(videoId)) {
+      res.status(400).json({ error: 'A valid 11-character YouTube video id is required.' });
+      return;
+    }
     const title = String(req.query.title || `YouTube Audio ${videoId}`).trim();
-    const artist = String(req.query.artist || 'YouTube Creator').trim();
-    const bitrate = parseInt(String(req.query.bitrate || '320'), 10) || 320;
-    const durationSeconds = req.query.duration
-      ? parseInt(String(req.query.duration), 10)
-      : undefined;
-    const normalize = req.query.normalize === 'true';
-    const trimStart = req.query.trimStart ? parseFloat(String(req.query.trimStart)) : undefined;
-    const trimEnd = req.query.trimEnd ? parseFloat(String(req.query.trimEnd)) : undefined;
+    const artist = String(req.query.artist || 'YouTube').trim();
+    const bitrate = parseBitrate(req.query.bitrate);
+    const duration = req.query.duration ? parseInt(String(req.query.duration), 10) : undefined;
+    const prefix = String(req.query.prefix || '').replace(/\D/g, '').slice(0, 4);
 
-    if (!/^[a-zA-Z0-9_-]{11}$/.test(videoId)) {
-      res.status(400).json({ error: 'Valid 11-character YouTube videoId is required.' });
+    const baseName = sanitizeFilename(`${artist} - ${title}`);
+    const safeName = prefix ? `${prefix} - ${baseName}` : baseName;
+
+    const job = ensureJob(videoId, bitrate, duration);
+    await job.promise;
+    if (job.state !== 'ready') {
+      res.status(500).json({ error: job.error || 'MP3 conversion failed.' });
       return;
     }
 
-    // Optional "01", "02"... prefix so files sort in the same order the links were given
-    const prefix = String(req.query.prefix || '').replace(/\D/g, '').slice(0, 4);
-    const baseName = sanitizeFilename(`${artist} - ${title}`);
-    const safeName = prefix ? `${prefix} - ${baseName}` : baseName;
-    const asciiFallbackName =
-      safeName.replace(/[^\x20-\x7E]/g, '').trim() || `youtube-${videoId}`;
-
-    const needsPostProcessing =
-      normalize ||
-      Boolean(trimStart && trimStart > 0) ||
-      Boolean(trimEnd && trimEnd > 0);
-
-    // Fast streaming path: stream full-length MP3 directly to client without buffering 100MB in RAM
-    if (!needsPostProcessing) {
-      try {
-        const directMp3Url = await resolveDirectMp3UrlViaConverter(
-          videoId,
-          bitrate,
-          durationSeconds
-        );
-        const upstreamRes = await fetch(directMp3Url, {
-          headers: {
-            'User-Agent': BROWSER_UA,
-            Referer: 'https://cnvmp3.com/',
-          },
-        });
-        if (upstreamRes.ok && upstreamRes.body) {
-          res.setHeader('Content-Type', 'audio/mpeg');
-          const contentLen = upstreamRes.headers.get('content-length');
-          if (contentLen) {
-            res.setHeader('Content-Length', contentLen);
-          }
-          res.setHeader(
-            'Content-Disposition',
-            `attachment; filename="${asciiFallbackName}.mp3"; filename*=UTF-8''${encodeURIComponent(safeName)}.mp3`
-          );
-          const nodeStream = Readable.fromWeb(upstreamRes.body as import('stream/web').ReadableStream);
-          nodeStream.on('error', () => {
-            if (!res.headersSent) {
-              res.status(500).end();
-            } else {
-              res.end();
-            }
-          });
-          nodeStream.pipe(res);
-          return;
-        }
-      } catch {
-        // Fall through to buffered FFmpeg path
+    if (job.engine === 'ytdlp') {
+      const file = yt.cachedFile(videoId, bitrate);
+      if (!file) {
+        res.status(500).json({ error: 'The converted file expired. Please try again.' });
+        return;
       }
+      // sendFile adds Content-Length and supports resuming a partly finished download
+      res.download(file, `${safeName}.mp3`, { dotfiles: 'allow' }, (err) => {
+        if (err && !res.headersSent) res.status(500).json({ error: 'Could not send the file.' });
+      });
+      return;
     }
 
-    const mp3Buffer = await generateMp3Buffer({
-      videoId,
-      title,
-      artist,
-      bitrate,
-      normalize,
-      durationSeconds,
-      trimStart,
-      trimEnd,
+    // Fallback engine: pass the converter's file straight through without holding it in memory
+    const directUrl = await resolveDirectMp3UrlViaConverter(videoId, bitrate, duration);
+    const upstream = await fetch(directUrl, {
+      headers: { 'User-Agent': BROWSER_UA, Referer: 'https://cnvmp3.com/' },
     });
-
+    if (!upstream.ok || !upstream.body) {
+      resolvedDownloadUrlCache.delete(videoId);
+      res.status(502).json({ error: 'The converter did not return the file. Please try again.' });
+      return;
+    }
+    const asciiName = safeName.replace(/[^\x20-\x7E]/g, '').trim() || `youtube-${videoId}`;
     res.setHeader('Content-Type', 'audio/mpeg');
-    res.setHeader('Content-Length', String(mp3Buffer.length));
+    const contentLength = upstream.headers.get('content-length');
+    if (contentLength) res.setHeader('Content-Length', contentLength);
     res.setHeader(
       'Content-Disposition',
-      `attachment; filename="${asciiFallbackName}.mp3"; filename*=UTF-8''${encodeURIComponent(safeName)}.mp3`
+      `attachment; filename="${asciiName}.mp3"; filename*=UTF-8''${encodeURIComponent(safeName)}.mp3`
     );
-    res.send(mp3Buffer);
+    const stream = Readable.fromWeb(upstream.body as import('stream/web').ReadableStream);
+    stream.on('error', () => res.destroy());
+    stream.pipe(res);
   } catch (err) {
-    res.status(500).json({
-      error: err instanceof Error ? err.message : 'MP3 conversion failed',
-    });
+    if (!res.headersSent) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'MP3 conversion failed.' });
+    } else {
+      res.destroy();
+    }
   }
 });
 
 async function startServer() {
+  const version = await yt.detectYtdlp();
+  if (ENGINE === 'converter') {
+    console.log('Engine: third-party converter (cnvmp3.com), as set by ENGINE=converter.');
+  } else if (version) {
+    console.log(`Engine: yt-dlp ${version} on this server${ENGINE === 'auto' ? ' (converter is the fallback)' : ''}.`);
+  } else if (ENGINE === 'ytdlp') {
+    console.error('ENGINE=ytdlp but yt-dlp was not found. Install it or set YTDLP_PATH. Conversions will fail.');
+  } else {
+    console.warn(
+      'yt-dlp not found, using the third-party converter (cnvmp3.com). Videos over 20 minutes will be 128 kbps at best. Install yt-dlp for long videos.'
+    );
+  }
+
+  yt.sweepCache();
+  setInterval(() => {
+    yt.sweepCache();
+    for (const [key, job] of jobs) {
+      if (job.state !== 'working' && !jobStillValid(job, key.slice(0, 11), Number(key.slice(12)))) {
+        jobs.delete(key);
+      }
+    }
+  }, 10 * 60 * 1000).unref();
+
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },
