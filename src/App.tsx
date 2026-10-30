@@ -8,6 +8,8 @@ const BITRATES: BitrateOption[] = [128, 192, 320];
 const LONG_VIDEO_SECONDS = 20 * 60;
 const POLL_MS = 1500;
 const GIVE_UP_MS = 95 * 60 * 1000;
+// Files up to this size are fetched into memory and saved from there; larger ones use a plain download link
+const MAX_IN_MEMORY_BYTES = 400 * 1024 * 1024;
 
 type Notice = { kind: 'error' | 'info'; text: string };
 
@@ -127,6 +129,38 @@ function saveFromUrl(href: string, name: string) {
   document.body.removeChild(a);
 }
 
+// Requests the MP3 the same way the page asks for everything else (fetch), and refuses anything that is not audio.
+// A direct download link can be answered by the hosting site with its own page (for example a "Cookie check"),
+// which would then be saved as if it were the MP3. Checking the type here makes that impossible.
+async function fetchAudio(url: string): Promise<Response> {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(await readError(res, 'Download failed.'));
+  const type = res.headers.get('content-type') || '';
+  if (!type.toLowerCase().startsWith('audio/')) {
+    await res.body?.cancel();
+    throw new Error(
+      type.toLowerCase().includes('html')
+        ? 'The website host answered with a web page instead of the MP3 (for example a cookie check). Open this app in its own browser tab and try again.'
+        : `The server sent ${type || 'an unknown type'} instead of audio.`
+    );
+  }
+  return res;
+}
+
+async function saveAudio(url: string, name: string): Promise<void> {
+  const res = await fetchAudio(url);
+  const size = Number(res.headers.get('content-length')) || 0;
+  if (size > MAX_IN_MEMORY_BYTES) {
+    // too big to hold in memory: let the browser download it directly
+    await res.body?.cancel();
+    saveFromUrl(url, name);
+    return;
+  }
+  const href = URL.createObjectURL(await res.blob());
+  saveFromUrl(href, name);
+  setTimeout(() => URL.revokeObjectURL(href), 60000);
+}
+
 // ---------- component ----------
 
 export default function App() {
@@ -227,7 +261,7 @@ export default function App() {
     patch(track.id, { status: 'converting', error: undefined });
     try {
       await prepareTrack(track, bitrate);
-      saveFromUrl(downloadUrl(track, index, total, bitrate), fileName(track, index, total));
+      await saveAudio(downloadUrl(track, index, total, bitrate), fileName(track, index, total));
       patch(track.id, { status: 'done' });
       return true;
     } catch (err) {
@@ -254,7 +288,7 @@ export default function App() {
         break;
       }
       const ok = await saveOne(tracks[i], i, total);
-      if (ok) await sleep(800); // gives the browser a moment to start each download before the next one
+      if (ok) await sleep(400); // a short pause so the browser handles each file save in turn
       else failed++;
     }
     setBusy(null);
@@ -278,8 +312,7 @@ export default function App() {
       patch(track.id, { status: 'converting', error: undefined });
       try {
         await prepareTrack(track, bitrate);
-        const res = await fetch(downloadUrl(track, i, total, bitrate));
-        if (!res.ok) throw new Error(await readError(res, 'Conversion failed.'));
+        const res = await fetchAudio(downloadUrl(track, i, total, bitrate));
         zip.file(fileName(track, i, total), await res.blob());
         patch(track.id, { status: 'done' });
         added++;
