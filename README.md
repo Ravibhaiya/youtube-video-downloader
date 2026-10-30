@@ -28,6 +28,13 @@ for videos longer than 20 minutes. Set ENGINE=ytdlp to never use it.
 
 Keep yt-dlp up to date (`pip install -U yt-dlp`). YouTube changes often and old versions stop working.
 
+## Hosting
+
+Run this app on a host where you can install yt-dlp and ffmpeg and open the site in its own browser tab
+(your own computer, a VPS, or a container you control). A preview window inside another website, such as
+the Google AI Studio preview, can answer downloads with its own "Cookie check" page, and its server
+usually has no yt-dlp. The app now refuses to save such a page as an MP3 and tells you instead.
+
 ## Troubleshooting
 
 - Every converted file is checked before it is sent: it must be real MP3 audio and its length must match
